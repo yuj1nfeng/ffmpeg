@@ -19,23 +19,21 @@ async function getVideoDuration(input) {
  * @async
  * @function addWatermark
  * @param {string} input - 输入文件的路径。
- * @param {string} watermark_img - 水印图片的路径。
+ * @param {string} watermark - 水印图片的路径。
+ * @param {string} output - 输出文件的路径。
  * @param {Object} [opts={}] - 配置选项。
  * @param {string} [opts.position='right-top'] - 水印位置，可选值：right-top left-top right-bottom left-bottom {x: number, y: number}
  * @param {number} [opts.margin=10] - 水印与边缘的间距（像素）。
  * @param {number} [opts.scale=1] - 水印的缩放比例。
  * @param {number} [opts.opacity=1] - 水印的透明度，取值范围为 0 到 1。
  * @param {number} [opts.rotate=0] - 水印的旋转角度（度数）
- * @param {boolean} [opts.crf=23]
- * @param {boolean} [opts.preset='ultrafast']
+ * @param {number} [opts.crf=23]
+ * @param {string} [opts.preset='ultrafast']
  * @returns {Promise<string>} - 返回输出文件的绝对路径。
  * @throws {Error} - 如果添加水印失败，抛出错误。
  */
-async function addWatermark(input, watermark_img, opts = {}) {
-    const { position = 'left-top', margin = 10, scale = 1, opacity = 1.0, rotate = 0, crf = 23, preset = 'ultrafast' } = opts;
-    const flag = `watermark.${scale}.${opacity}.${rotate}.${position}.${margin}`;
-    const output = path.join(path.dirname(input), `${path.basename(input, path.extname(input))}.${flag}${path.extname(input)}`);
-
+async function addWatermark(input, watermark, output, opts = {}) {
+    const { progress_cb = null, position = 'left-top', margin = 10, scale = 1, opacity = 1.0, rotate = 0, crf = 23, preset = 'ultrafast' } = opts;
     // 计算水印位置
     let overlay_pos = '';
     // W:视频宽度 H:视频高度 w:水印宽度 h:水印高度
@@ -58,22 +56,31 @@ async function addWatermark(input, watermark_img, opts = {}) {
     }
     const water_filter = [];
     water_filter.push(`format=rgba`);
-    water_filter.push(`rotate=${rotate}*PI/180:c=none`);
+    if (rotate !== 0) water_filter.push(`rotate=${rotate}*(PI/180):c=none`);
     water_filter.push(`colorchannelmixer=aa=${opacity}`);
     water_filter.push(`scale=iw*${scale}:-1`);
-    const filter_complex = [`[1]${water_filter.join(',')}[wm]`, `[0][wm]overlay=${overlay_pos}`];
-
-    const env = {
-        input: input,
-        output: output,
-        watermark: watermark_img,
-        filter_complex: filter_complex.join(';'),
-        crf: crf,
-        preset: preset,
-    };
-
-    const { exitCode, stderr } = await Bun.$`ffmpeg -i $input -i $watermark -filter_complex $filter_complex -c:a copy -crf $crf -preset $preset -y $output`.env(env).quiet();
-    if (exitCode !== 0) throw new Error(stderr);
+    const filter_complex = [`[1:v]${water_filter.join(',')}[wm]`, `[0][wm]overlay=${overlay_pos}`];
+    const cmds = ['ffmpeg'];
+    cmds.push('-i', input);
+    cmds.push('-i', watermark);
+    cmds.push('-filter_complex', filter_complex.join(';'));
+    cmds.push('-crf', crf.toString());
+    cmds.push('-preset', preset);
+    cmds.push('-y', output);
+    console.log(cmds.join(' '));
+    const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
+    const [progress_stream, err_stream] = proc.stderr.tee();
+    if (progress_cb != null) {
+        const progressHandler = createProgressHandler(progress_cb);
+        const duration = await getVideoDuration(input);
+        progressHandler.setTotalDuration(duration);
+        await progress_stream.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
+    }
+    await proc.exited;
+    if (proc.exitCode !== 0) {
+        const error = await new Response(err_stream).text();
+        throw new Error(`FFMPEG处理失败,错误信息:\r\n ${error}`);
+    }
     return path.resolve(output);
 }
 
@@ -81,19 +88,36 @@ async function addWatermark(input, watermark_img, opts = {}) {
  * @async
  * @function extraAudio 音频提取辅助函数
  * @param {string} input  输入视频文件路径
- * @param {string} [codec="mp3"]     音频编码器，如 'mp3', 'aac', 'ac3', 'flac', 'mp2'
- * @param {string} [bitrate]   音频码率，如 "192k"
+ * @param {string} output 输出文件路径
+ * @param {Object} [opts={}] 配置选项
+ * @param {string} [opts.codec='copy'] 编码器
+ * @param {string} [opts.bitrate=''] 比特率
+ * @param {function} [opts.progress_cb=null] 进度回调函数
  * @returns {Promise<string>} 提取完成后返回输出文件的绝对路径
  */
-async function extraAudio(input, codec = 'copy', bitrate = null) {
+async function extraAudio(input, output, opts = {}) {
+    let { codec = 'mp3', bitrate = '', progress_cb = null } = opts;
     const meta = await getMetadata(input);
     if (codec === 'copy') codec = meta.audio.codec;
-    if (bitrate == null) bitrate = meta.audio.bit_rate;
-    const output = input + `.` + codec;
-
-    const env = { input, output, codec, bitrate };
-    const { exitCode, stderr } = await Bun.$`ffmpeg -i $input -vn -acodec $codec -b:a $bitrate -y $output`.env(env).quiet();
-    if (exitCode !== 0) throw new Error(stderr);
+    if (bitrate == '') bitrate = meta.audio.bit_rate;
+    const cmds = ['ffmpeg'];
+    cmds.push('-i', input);
+    cmds.push('-vn');
+    cmds.push('-acodec', codec);
+    cmds.push('-b:a', bitrate);
+    cmds.push('-y', output);
+    const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
+    const [progress_stream, err_stream] = proc.stderr.tee();
+    if (progress_cb != null) {
+        const progressHandler = createProgressHandler(progress_cb);
+        progressHandler.setTotalDuration(meta.video.duration);
+        await progress_stream.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
+    }
+    await proc.exited;
+    if (proc.exitCode !== 0) {
+        const error = await new Response(err_stream).text();
+        throw new Error(`FFMPEG处理失败,错误信息:\r\n ${error}`);
+    }
     return path.resolve(output);
 }
 
@@ -102,49 +126,75 @@ async function extraAudio(input, codec = 'copy', bitrate = null) {
  * @function convertVideoFmt 转换视频格式
  * @param {string} input 输入文件路径
  * @param {string} output 输出文件路径
- * @param {string} codec 视频编码器，如 "libx264"、"libx265" "mpeg4" "h264" "h265" "vp8" "vp9"
- * @param {string} crf  视频质量,此值的范围是 0 到 51：0 表示高清无损；23 是默认值（如果没有指定此参数）；51 虽然文件最小，但效果是最差的。
- * @param {string} preset  'ultrafast' 速度优先、质量优先、无损压缩  'fast' 'medium' 'slow' 'slower' 'veryslow'  'placebo'  'default'
+ * @param {Object} [opts={}] 配置选项
+ * @param {string} [opts.codec='libx264'] 编码器
+ * @param {number} [opts.crf=23] 压缩率
+ * @param {string} [opts.preset='ultrafast'] 预设
+ * @param {function} [opts.progress_cb=null] 进度回调函数
  * @returns
  */
-async function convertVideoFmt(input, output, codec = 'libx264', crf = 23, preset = 'ultrafast') {
-    const env = {
-        input: input,
-        output: output,
-        codec: codec,
-        crf: crf,
-        preset: preset,
-    };
-    const { exitCode, stderr } = await Bun.$`ffmpeg -i $input -c:v $codec -crf $crf -preset $preset -c:a copy  -y $output`.env(env).quiet();
-    if (exitCode !== 0) throw new Error(stderr.toString());
+async function convertVideoFmt(input, output, opts = {}) {
+    const { codec = '', crf = 23, preset = 'ultrafast', progress_cb = null } = opts;
+    const cmds = ['ffmpeg'];
+    cmds.push('-i', input);
+    if (codec !== '') cmds.push('-c:v', codec);
+    cmds.push('-crf', crf.toString());
+    cmds.push('-preset', preset);
+    cmds.push('-y', output);
+    const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
+    const [progress_stream, err_stream] = proc.stderr.tee();
+    if (progress_cb != null) {
+        const progressHandler = createProgressHandler(progress_cb);
+        const duration = await getVideoDuration(input);
+        progressHandler.setTotalDuration(duration);
+        await progress_stream.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
+    }
+    await proc.exited;
+    if (proc.exitCode !== 0) {
+        const error = await new Response(err_stream).text();
+        throw new Error(`FFMPEG处理失败,错误信息:\r\n ${error}`);
+    }
     return path.resolve(output);
 }
 
 /**
  * @async
- * @function cropVideo 裁剪视频文件
+ * @function sliceVideo 裁剪视频文件
  * @param {string} input - 输入视频文件的路径。
- * @param {number} start - 裁剪的起始时间（单位：秒）。
- * @param {number} duration - 裁剪的持续时间（单位：秒）。
- * @returns {Promise<string>} - 返回裁剪后的视频文件的绝对路径。
+ * @param {string} output - 输出视频文件的路径。
+ * @param {Object} [opts={}] - 配置选项。
+ * @param {number} [opts.start=0] - 裁剪的起始时间（秒）。
+ * @param {number} [opts.duration=10] - 裁剪的时长（秒）。
+ * @param {function} [opts.progress_cb=null] - 进度回调函数。
+ * @returns {Promise<string>} - 返回裁剪后的视频文件的路径。
  * @throws {Error} - 如果裁剪失败，抛出错误。
  */
-async function cropVideo(input, start, duration) {
+async function sliceVideo(input, output, opts = {}) {
+    let { progress_cb = null, start = 0, duration = 10, } = opts;
     const meta = await getMetadata(input);
     if (start < 0) start = 0;
     if (duration < 0) duration = 0;
     if (start > meta.video.duration) start = meta.video.duration;
     if (start + duration > meta.video.duration) duration = meta.video.duration - start;
-
-    const output = path.join(path.dirname(input), `${path.basename(input, path.extname(input))}.${start}-${start + duration}.crop${path.extname(input)}`);
-    const env = {
-        input: input,
-        output: output,
-        start: start,
-        duration: duration,
-    };
-    const { exitCode, stderr } = await Bun.$`ffmpeg -i $input -ss $start -t $duration -c:v copy -c:a copy -y $output`.env(env).quiet();
-    if (exitCode !== 0) throw new Error(stderr);
+    const cmds = ['ffmpeg'];
+    cmds.push('-i', input);
+    cmds.push('-ss', start.toString());
+    cmds.push('-t', duration.toString());
+    cmds.push('-c:v', 'copy');
+    cmds.push('-c:a', 'copy');
+    cmds.push('-y', output);
+    const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
+    const [progress_stream, err_stream] = proc.stderr.tee();
+    if (progress_cb != null) {
+        const progressHandler = createProgressHandler(progress_cb);
+        progressHandler.setTotalDuration(duration);
+        await progress_stream.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
+    }
+    await proc.exited;
+    if (proc.exitCode !== 0) {
+        const error = await new Response(err_stream).text();
+        throw new Error(`FFMPEG处理失败,错误信息:\r\n ${error}`);
+    }
     return path.resolve(output);
 }
 
@@ -153,11 +203,17 @@ async function cropVideo(input, start, duration) {
  * @function concatVideos 拼接多个视频文件
  * @param {string[]} inputs - 输入视频文件路径数组
  * @param {string} output - 输出视频文件路径
- * @param {function} progressCallback - 进度回调函数
+ * @param {Object} [opts={}] - 配置选项
+ * @param {function} [opts.progress_cb=null] - 进度回调函数
+ * @param {string} [opts.video_codec='libx264'] - 视频编码器
+ * @param {string} [opts.audio_codec='aac'] - 视频编码器
+ * @param {number} [opts.crf=23] - 压缩率
+ * @param {string} [opts.preset='ultrafast'] - 预设
  * @returns {Promise<string>} - 返回拼接后的视频文件绝对路径
  * @throws {Error} - 如果拼接失败，抛出错误
  */
-async function concatVideos(inputs, output, progressCallback = null) {
+async function concatVideos(inputs, output, opts = {}) {
+    const { progress_cb = null, video_codec = 'libx264', audio_codec = 'aac', crf = 23, preset = 'ultrafast' } = opts;
     if (inputs.length === 0) throw new Error('没有输入视频文件');
     const list_file = path.join(os.tmpdir(), 'concat_list.txt');
     await fs.rm(list_file, { recursive: true, force: true });
@@ -167,21 +223,23 @@ async function concatVideos(inputs, output, progressCallback = null) {
     cmds.push('-f', 'concat');
     cmds.push('-safe', '0');
     cmds.push('-i', list_file);
-    cmds.push('-c:v', 'copy');
+    cmds.push('-c:v', video_codec);
+    cmds.push('-c:a', audio_codec);
+    cmds.push('-crf', crf.toString());
+    cmds.push('-preset', preset);
     cmds.push('-y', output);
     const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
 
-    if (progressCallback != null) {
-        const progressHandler = createProgressHandler(progressCallback);
+    if (progress_cb != null) {
+        const progressHandler = createProgressHandler(progress_cb);
         const duration = (await Promise.all(inputs.map(getVideoDuration))).reduce((sum, duration) => sum + duration, 0);
         progressHandler.setTotalDuration(duration);
-        proc.stderr.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
+        await proc.stderr.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
     }
     await proc.exited;
-    const exitCode = proc.exitCode;
-    if (exitCode !== 0) {
+    if (proc.exitCode !== 0) {
         const error_output = await new Response(proc.stderr).text();
-        throw new Error(`FFmpeg处理失败，退出码: ${exitCode}\n错误信息: ${error_output}`);
+        throw new Error(`FFMPEG处理失败,错误信息:\r\n ${error_output}`);
     }
     return path.resolve(output);
 }
@@ -201,23 +259,23 @@ async function getMetadata(input) {
     return {
         video: videoStream
             ? {
-                  codec: videoStream.codec_name,
-                  width: videoStream.width,
-                  height: videoStream.height,
-                  duration: parseFloat(videoStream.duration),
-                  bit_rate: parseInt(videoStream.bit_rate || info.format.bit_rate),
-                  frame_rate: videoStream.r_frame_rate,
-                  pixel_format: videoStream.pix_fmt,
-              }
+                codec: videoStream.codec_name,
+                width: videoStream.width,
+                height: videoStream.height,
+                duration: parseFloat(videoStream.duration),
+                bit_rate: parseInt(videoStream.bit_rate || info.format.bit_rate),
+                frame_rate: videoStream.r_frame_rate,
+                pixel_format: videoStream.pix_fmt,
+            }
             : null,
         audio: audioStream
             ? {
-                  codec: audioStream.codec_name,
-                  sample_rate: parseInt(audioStream.sample_rate),
-                  channels: audioStream.channels,
-                  bit_rate: parseInt(audioStream.bit_rate),
-                  duration: parseFloat(audioStream.duration),
-              }
+                codec: audioStream.codec_name,
+                sample_rate: parseInt(audioStream.sample_rate),
+                channels: audioStream.channels,
+                bit_rate: parseInt(audioStream.bit_rate),
+                duration: parseFloat(audioStream.duration),
+            }
             : null,
         ...info.format,
     };
@@ -225,15 +283,17 @@ async function getMetadata(input) {
 
 /**
  * @async
- * @function autoCropVideos 自动裁剪视频(在输入目录中寻找所有视频文件,从每个视频随机裁剪 min_sec 到 max_sec 秒,初始到 out_dir 中)
- * @param {string} root_dir 输入目录
- * @param {string} out_dir 输出目录
- * @param {number} min_sec 最小裁剪时长
- * @param {number} max_sec 最大裁剪时长
- * @param {string} file_extensions 视频文件扩展名数组
+ * @function autoClipVideos 自动裁剪视频(在输入目录中寻找所有视频文件,从每个视频随机裁剪 min_sec 到 max_sec 秒,初始到 out_dir 中)
+ * @param {string} root_dir 输入目录路径
+ * @param {Object} [opts={}] 配置选项
+ * @param {number} [opts.min_sec=5] 最小裁剪时长
+ * @param {number} [opts.max_sec=10] 最大裁剪时长
+ * @param {string} [opts.file_extensions='mp4,avi,flv,wmv,rmvb,mkv'] 文件扩展名
+ * @param {function} [opts.progress_cb=null] 进度回调函数
  * @returns {Promise<Array<string>>} 输出文件路径数组
  */
-async function autoCropVideos(root_dir, min_sec = 5, max_sec = 10, file_extensions = 'mp4,mov') {
+async function autoClipVideos(root_dir, opts = {}) {
+    const { min_sec = 5, max_sec = 10, file_extensions = 'mp4,avi,flv,wmv,rmvb,mkv', progress_cb = null } = opts;
     let files = await fs.readdir(root_dir, { withFileTypes: true, recursive: true });
     const includes = file_extensions.split(',').map((p) => `.${p}`);
     files = files.filter((p) => p.isFile() && includes.includes(path.extname(p.name.toLowerCase())));
@@ -243,24 +303,26 @@ async function autoCropVideos(root_dir, min_sec = 5, max_sec = 10, file_extensio
     // 处理每个视频文件
     for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        console.log(`处理文件 ${i + 1}/${files.length}: ${path.basename(file)}`);
+        // console.log(`处理文件 ${i + 1}/${files.length}: ${path.basename(file)}`);
         try {
-            // 获取视频信息
-            const videoInfo = await getMetadata(file);
-            const duration = parseFloat(videoInfo.video.duration);
+            const duration = await getVideoDuration(file);
             if (duration < min_sec) {
-                console.log(`  跳过: 视频时长 ${duration.toFixed(2)} 秒太短`);
+                // console.log(`  跳过: 视频时长 ${duration.toFixed(2)} 秒太短`);
                 continue;
             }
             const clip_duration = Math.floor(Math.random() * (max_sec - min_sec + 1)) + min_sec;
             const max_start = Math.max(0, duration - clip_duration);
             const start_time = Math.floor(Math.random() * max_start);
-            const clip_file = await cropVideo(file, start_time, clip_duration);
+            const output = path.join(os.tmpdir(), `${path.basename(file, path.extname(file))}-${start_time}-${start_time + clip_duration}.${path.extname(file)}`);
+            const clip_file = await sliceVideo(file, output, { start: start_time, duration: clip_duration });
             clip_files.push(clip_file);
-            console.log(`  剪辑: ${start_time}-${start_time + clip_duration}秒 (${clip_duration}秒)`);
+            // console.log(`  剪辑: ${start_time}-${start_time + clip_duration}秒 (${clip_duration}秒)`);
         } catch (error) {
             console.error(` ${file} 处理失败: ${error.message}`);
         }
+        const progress = ((i + 1) / files.length) * 100;
+        if (progress_cb != null) progress_cb(progress.toFixed(2));
+
     }
     return clip_files;
 }
@@ -277,17 +339,21 @@ async function autoCropVideos(root_dir, min_sec = 5, max_sec = 10, file_extensio
  * @param {number} [opts.max_sec=10] - 每个视频最大裁剪时长
  * @param {string} [opts.transition_mode] - 转场特效类型，支持：fade, wipe, slide, dissolve
  * @param {number} [opts.transition_duration=1] - 转场持续时间，单位：秒
+ * 
  */
 async function autoCutVideo(root_dir, output, opts = {}) {
-    const { min_sec = 5, max_sec = 10, file_extensions = 'mp4,mov', transition_mode, transition_duration } = opts;
-    const clip_files = await autoCropVideos(root_dir, min_sec, max_sec, file_extensions);
+    const { min_sec = 5, max_sec = 10, file_extensions = 'mp4,mov', transition_mode, transition_duration, progress_cb = null } = opts;
+    const clip_cb = (progress) => (progress_cb != null) && progress_cb((Number(progress) / 2).toFixed(2));
+    const concat_cb = (progress) => (progress_cb != null) && progress_cb(((Number(progress) / 2) + 50).toFixed(2));
+    let clip_files = [];
     try {
-        await concatVideos(clip_files, output, { transition_mode, transition_duration });
+        clip_files = await autoClipVideos(root_dir, { min_sec, max_sec, file_extensions, progress_cb: clip_cb });
+        await concatVideos(clip_files, output, { transition_mode, transition_duration, progress_cb: concat_cb });
         return path.resolve(output);
     } catch (error) {
         throw error;
     } finally {
-        for (const file of clip_files) await fs.unlink(file);
+        await Promise.all(clip_files.map((file) => fs.unlink(file)));
     }
 }
 
@@ -309,36 +375,55 @@ async function getCodecs() {
         }
     };
 
-    const codecs = {};
+    const codecs = [];
     for (const line of lines) {
-        if (line == '') continue;
+        if (line === '' || line === '\r') continue;
         const flags = line.slice(1, 7);
         const codec = line.slice(7).trim().split(' ')[0].trim();
         const desc = line.split(codec)[1].trim();
-        codecs[codec] = {
+        codecs.push({
+            codec: codec,
             type: typeMap(flags[2]),
-            decode: flags[0] == 'D',
-            encode: flags[1] == 'E',
-            intra_frame_only: flags[3] == 'I',
-            lossy_compression: flags[4] == 'L',
-            lossless_compression: flags[5] == 'S',
+            can_decode: flags[0] === 'D',
+            can_encode: flags[1] === 'E',
+            intra_frame_only: flags[3] === 'I',
+            lossy_compression: flags[4] === 'L',
+            lossless_compression: flags[5] === 'S',
             desc: desc,
-        };
+        });
     }
     return codecs;
 }
 
+async function getAvailableVideoEncoders() {
+    const result = await getCodecs();
+    return result.filter((p) => p.type === 'video' && p.can_encode).map((p) => p.codec);
+}
+async function getAvailableVideoDecoders() {
+    const result = await getCodecs();
+    return result.filter((p) => p.type === 'video' && p.can_decode).map((p) => p.codec);
+}
+
+async function getAvailableAudioEncoders() {
+    const result = await getCodecs();
+    return result.filter((p) => p.type === 'audio' && p.can_encode).map((p) => p.codec);
+}
+async function getAvailableAudioDecoders() {
+    const result = await getCodecs();
+    return result.filter((p) => p.type === 'audio' && p.can_decode).map((p) => p.codec);
+}
+
 /**
  * 创建进度处理回调函数
- * @param {function} progressCallback 外部进度回调
+ * @param {function} progress_cb 外部进度回调
  * @returns {object} 包含处理进度的对象
  * @description 该函数创建一个进度处理回调函数，用于处理FFmpeg的输出，提取进度信息并调用外部进度回调函数。
  * 使用方式
- * const progressHandler = createProgressHandler(progressCallback);
+ * const progressHandler = createProgressHandler(progress_cb);
  * progressHandler.setTotalDuration(duration);  number | string(‘00:00:30’)
  * process.stderr.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
  */
-function createProgressHandler(progressCallback = () => {}) {
+function createProgressHandler(progress_cb = () => { }) {
     let totalDuration = 0;
     // 解析时长字符串为秒数
     const parseDuration = (timeStr) => {
@@ -370,7 +455,7 @@ function createProgressHandler(progressCallback = () => {}) {
             const currentTime = hours * 3600 + minutes * 60 + seconds;
             // 计算进度百分比（限制在0-100之间）
             const progress = Math.min(Math.max((currentTime / totalDuration) * 100, 0), 100);
-            progressCallback(progress);
+            progress_cb(progress.toFixed(2));
         }
     };
 
@@ -381,12 +466,16 @@ function createProgressHandler(progressCallback = () => {}) {
 
 export default {
     addWatermark,
-    cropVideo,
+    sliceVideo,
     extraAudio,
     convertVideoFmt,
     getMetadata,
     concatVideos,
-    autoCropVideos,
+    autoClipVideos,
     autoCutVideo,
     getCodecs,
+    getAvailableVideoEncoders,
+    getAvailableVideoDecoders,
+    getAvailableAudioEncoders,
+    getAvailableAudioDecoders,
 };

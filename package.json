@@ -1,6 +1,6 @@
 {
-    "name": "fffmpeg",
-    "version": "1.0.1",
+    "name": "yujf-ffmpeg",
+    "version": "1.0.9",
     "description": "koa router loader",
     "author": {
         "name": "yujinfeng",
@@ -11,6 +11,9 @@
     "private": false,
     "publishConfig": {
         "access": "public"
+    },
+    "imports": {
+        "#ffmpeg": "./index.js"
     },
     "peerDependencies": {
         "typescript": "^5"
