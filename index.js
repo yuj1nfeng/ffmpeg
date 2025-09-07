@@ -13,6 +13,15 @@ async function getVideoDuration(input) {
     return await Bun.$`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${input}`.text().then((output) => parseFloat(output.trim()));
 }
 
+async function generateThumbnail(input) {
+    const output = path.join(os.tmpdir(), `${Math.random().toString(36).substring(2, 15)}.jpg`);
+    const { stderr } = await Bun.$`ffmpeg -i ${input} -ss 1 -vframes 1 -q:v 2 -y ${output}`.quiet();
+    if (stderr) throw new Error(stderr);
+    const base64_img = (await fs.readFile(output)).toBase64();
+    await fs.unlink(output);
+    return base64_img;
+}
+
 /**
  * 为输入的视频或图片文件添加水印。
  *
@@ -479,4 +488,5 @@ export default {
     getAvailableVideoDecoders,
     getAvailableAudioEncoders,
     getAvailableAudioDecoders,
+    generateThumbnail
 };
