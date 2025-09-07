@@ -96,14 +96,14 @@ async function addWatermark(input, watermark, output, opts = {}) {
  * @returns {Promise<string>} 提取完成后返回输出文件的绝对路径
  */
 async function extraAudio(input, output, opts = {}) {
-    let { codec = 'mp3', bitrate = '', progress_cb = null } = opts;
+    let { codec = '', bitrate = '', progress_cb = null } = opts;
     const meta = await getMetadata(input);
     if (codec === 'copy') codec = meta.audio.codec;
     if (bitrate == '') bitrate = meta.audio.bit_rate;
     const cmds = ['ffmpeg'];
     cmds.push('-i', input);
     cmds.push('-vn');
-    cmds.push('-acodec', codec);
+    if (codec !== '') cmds.push('-acodec', codec);
     cmds.push('-b:a', bitrate);
     cmds.push('-y', output);
     const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
