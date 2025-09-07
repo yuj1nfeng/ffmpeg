@@ -15,11 +15,10 @@ async function getVideoDuration(input) {
 
 async function generateThumbnail(input) {
     const output = path.join(os.tmpdir(), `${Math.random().toString(36).substring(2, 15)}.jpg`);
-    const { stderr } = await Bun.$`ffmpeg -i ${input} -ss 1 -vframes 1 -q:v 2 -y ${output}`.quiet();
-    if (stderr) throw new Error(stderr);
+    await Bun.$`ffmpeg -ss 1 -i ${input} -vframes 1 -q:v 2 -y  ${output}`.quiet();
     const base64_img = (await fs.readFile(output)).toBase64();
     await fs.unlink(output);
-    return base64_img;
+    return `data:image/jpeg;base64,${base64_img}`;
 }
 
 /**
