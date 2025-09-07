@@ -215,7 +215,7 @@ async function sliceVideo(input, output, opts = {}) {
 async function concatVideos(inputs, output, opts = {}) {
     const { progress_cb = null, video_codec = 'libx264', audio_codec = 'aac', crf = 23, preset = 'ultrafast' } = opts;
     if (inputs.length === 0) throw new Error('没有输入视频文件');
-    const list_file = path.join(os.tmpdir(), 'concat_list.txt');
+    const list_file = path.join(os.tmpdir(), `${Bun.randomUUIDv7()}.txt`);
     await fs.rm(list_file, { recursive: true, force: true });
     const list_content = inputs.map((input) => `file '${path.resolve(input).replace(/\\/g, '/')}'`).join('\n');
     await fs.writeFile(list_file, list_content, 'utf8');
