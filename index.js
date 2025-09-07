@@ -455,7 +455,8 @@ function createProgressHandler(progress_cb = () => { }) {
             const currentTime = hours * 3600 + minutes * 60 + seconds;
             // 计算进度百分比（限制在0-100之间）
             const progress = Math.min(Math.max((currentTime / totalDuration) * 100, 0), 100);
-            progress_cb(progress.toFixed(2));
+            // progress_cb(progress.toFixed(2));
+            progress_cb({ current: currentTime, total: totalDuration });
         }
     };
 
