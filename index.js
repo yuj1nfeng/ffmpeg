@@ -68,13 +68,13 @@ async function addWatermark(input, watermark, output, opts = {}) {
     water_filter.push(`colorchannelmixer=aa=${opacity}`);
     water_filter.push(`scale=iw*${scale}:-1`);
     const filter_complex = [`[1:v]${water_filter.join(',')}[wm]`, `[0][wm]overlay=${overlay_pos}`];
-    const cmds = ['ffmpeg'];
+    const cmds = ['ffmpeg', '-y'];
     cmds.push('-i', input);
     cmds.push('-i', watermark);
     cmds.push('-filter_complex', filter_complex.join(';'));
     cmds.push('-crf', crf.toString());
     cmds.push('-preset', preset);
-    cmds.push('-y', output);
+    cmds.push(output);
     console.log(cmds.join(' '));
     const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
     const [progress_stream, err_stream] = proc.stderr.tee();
@@ -108,12 +108,12 @@ async function extraAudio(input, output, opts = {}) {
     const meta = await getMetadata(input);
     if (codec === 'copy') codec = meta.audio.codec;
     if (bitrate == '') bitrate = meta.audio.bit_rate;
-    const cmds = ['ffmpeg'];
+    const cmds = ['ffmpeg', '-y'];
     cmds.push('-i', input);
     cmds.push('-vn');
     if (codec !== '') cmds.push('-acodec', codec);
     cmds.push('-b:a', bitrate);
-    cmds.push('-y', output);
+    cmds.push(output);
     const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
     const [progress_stream, err_stream] = proc.stderr.tee();
     if (progress_cb != null) {
@@ -143,12 +143,49 @@ async function extraAudio(input, output, opts = {}) {
  */
 async function convertVideoFmt(input, output, opts = {}) {
     const { codec = '', crf = 23, preset = 'ultrafast', progress_cb = null } = opts;
-    const cmds = ['ffmpeg'];
+    const cmds = ['ffmpeg', '-y'];
     cmds.push('-i', input);
     if (codec !== '') cmds.push('-c:v', codec);
     cmds.push('-crf', crf.toString());
     cmds.push('-preset', preset);
-    cmds.push('-y', output);
+    cmds.push(output);
+    const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
+    const [progress_stream, err_stream] = proc.stderr.tee();
+    if (progress_cb != null) {
+        const progressHandler = createProgressHandler(progress_cb);
+        const duration = await getVideoDuration(input);
+        progressHandler.setTotalDuration(duration);
+        await progress_stream.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
+    }
+    await proc.exited;
+    if (proc.exitCode !== 0) {
+        const error = await new Response(err_stream).text();
+        throw new Error(`FFMPEG处理失败,错误信息:\r\n ${error}`);
+    }
+    return path.resolve(output);
+}
+
+/**
+ * @async
+ * @function remvoeAudio 去除音频
+ * @param {string} input 输入文件路径
+ * @param {string} output 输出文件路径
+ * @param {Object} [opts={}] 配置选项
+ * @param {string} [opts.codec='libx264'] 编码器
+ * @param {number} [opts.crf=23] 压缩率
+ * @param {string} [opts.preset='ultrafast'] 预设
+ * @param {function} [opts.progress_cb=null] 进度回调函数
+ * @returns
+ */
+async function remvoeAudio(input, output, opts = {}) {
+    const { codec = '', crf = 23, preset = 'ultrafast', progress_cb = null } = opts;
+    const cmds = ['ffmpeg', '-y'];
+    cmds.push('-i', input);
+    cmds.push('-an'); // 去除音频
+    if (codec !== '') cmds.push('-c:v', codec);
+    cmds.push('-crf', crf.toString());
+    cmds.push('-preset', preset);
+    cmds.push(output);
     const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
     const [progress_stream, err_stream] = proc.stderr.tee();
     if (progress_cb != null) {
@@ -178,19 +215,19 @@ async function convertVideoFmt(input, output, opts = {}) {
  * @throws {Error} - 如果裁剪失败，抛出错误。
  */
 async function sliceVideo(input, output, opts = {}) {
-    let { progress_cb = null, start = 0, duration = 10, } = opts;
+    let { progress_cb = null, start = 0, duration = 10 } = opts;
     const meta = await getMetadata(input);
     if (start < 0) start = 0;
     if (duration < 0) duration = 0;
     if (start > meta.video.duration) start = meta.video.duration;
     if (start + duration > meta.video.duration) duration = meta.video.duration - start;
-    const cmds = ['ffmpeg'];
-    cmds.push('-i', input);
+    const cmds = ['ffmpeg', '-y'];
     cmds.push('-ss', start.toString());
+    cmds.push('-i', input);
     cmds.push('-t', duration.toString());
     cmds.push('-c:v', 'copy');
     cmds.push('-c:a', 'copy');
-    cmds.push('-y', output);
+    cmds.push(output);
     const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
     const [progress_stream, err_stream] = proc.stderr.tee();
     if (progress_cb != null) {
@@ -217,36 +254,41 @@ async function sliceVideo(input, output, opts = {}) {
  * @param {string} [opts.audio_codec='aac'] - 视频编码器
  * @param {number} [opts.crf=23] - 压缩率
  * @param {string} [opts.preset='ultrafast'] - 预设
+ * @param {string} [opts.preset='fps'] -
+ * @param {string} [opts.preset='scale'] - 视频缩放 {width: 1920, height: 1080}
  * @returns {Promise<string>} - 返回拼接后的视频文件绝对路径
  * @throws {Error} - 如果拼接失败，抛出错误
  */
 async function concatVideos(inputs, output, opts = {}) {
-    const { progress_cb = null, video_codec = 'libx264', audio_codec = 'aac', crf = 23, preset = 'ultrafast' } = opts;
+    const { progress_cb = null, scale, fps, video_codec = 'libx264', audio_codec = 'aac', crf = 23, preset = 'ultrafast' } = opts;
     if (inputs.length === 0) throw new Error('没有输入视频文件');
     const list_file = path.join(os.tmpdir(), `${Bun.randomUUIDv7()}.txt`);
     await fs.rm(list_file, { recursive: true, force: true });
     const list_content = inputs.map((input) => `file '${path.resolve(input).replace(/\\/g, '/')}'`).join('\n');
     await fs.writeFile(list_file, list_content, 'utf8');
-    const cmds = ['ffmpeg'];
+    const cmds = ['ffmpeg', '-y'];
     cmds.push('-f', 'concat');
     cmds.push('-safe', '0');
     cmds.push('-i', list_file);
     cmds.push('-c:v', video_codec);
     cmds.push('-c:a', audio_codec);
     cmds.push('-crf', crf.toString());
+    if (scale) cmds.push('-vf', `scale=${scale.width}:${scale.height}`);
+    if (fps) cmds.push('-r', fps.toString());
     cmds.push('-preset', preset);
-    cmds.push('-y', output);
+    cmds.push(output);
     const proc = Bun.spawn(cmds, { stdout: 'pipe', stderr: 'pipe' });
+    const [progress_stream, err_stream] = proc.stderr.tee();
 
     if (progress_cb != null) {
         const progressHandler = createProgressHandler(progress_cb);
         const duration = (await Promise.all(inputs.map(getVideoDuration))).reduce((sum, duration) => sum + duration, 0);
         progressHandler.setTotalDuration(duration);
-        await proc.stderr.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
+        await progress_stream.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
     }
     await proc.exited;
     if (proc.exitCode !== 0) {
-        const error_output = await new Response(proc.stderr).text();
+        const error_output = await new Response(err_stream).text();
         throw new Error(`FFMPEG处理失败,错误信息:\r\n ${error_output}`);
     }
     return path.resolve(output);
@@ -267,24 +309,25 @@ async function getMetadata(input) {
     return {
         video: videoStream
             ? {
-                codec: videoStream.codec_name,
-                width: videoStream.width,
-                height: videoStream.height,
-                duration: parseFloat(videoStream.duration),
-                bit_rate: parseInt(videoStream.bit_rate || info.format.bit_rate),
-                frame_rate: videoStream.r_frame_rate,
-                pixel_format: videoStream.pix_fmt,
-            }
+                  codec: videoStream.codec_name,
+                  width: videoStream.width,
+                  height: videoStream.height,
+                  duration: parseFloat(videoStream.duration),
+                  bit_rate: parseInt(videoStream.bit_rate || info.format.bit_rate),
+                  frame_rate: videoStream.r_frame_rate,
+                  pixel_format: videoStream.pix_fmt,
+              }
             : null,
         audio: audioStream
             ? {
-                codec: audioStream.codec_name,
-                sample_rate: parseInt(audioStream.sample_rate),
-                channels: audioStream.channels,
-                bit_rate: parseInt(audioStream.bit_rate),
-                duration: parseFloat(audioStream.duration),
-            }
+                  codec: audioStream.codec_name,
+                  sample_rate: parseInt(audioStream.sample_rate),
+                  channels: audioStream.channels,
+                  bit_rate: parseInt(audioStream.bit_rate),
+                  duration: parseFloat(audioStream.duration),
+              }
             : null,
+        duration: 0,
         ...info.format,
     };
 }
@@ -330,7 +373,6 @@ async function autoClipVideos(root_dir, opts = {}) {
         }
         const progress = ((i + 1) / files.length) * 100;
         if (progress_cb != null) progress_cb(progress.toFixed(2));
-
     }
     return clip_files;
 }
@@ -347,12 +389,12 @@ async function autoClipVideos(root_dir, opts = {}) {
  * @param {number} [opts.max_sec=10] - 每个视频最大裁剪时长
  * @param {string} [opts.transition_mode] - 转场特效类型，支持：fade, wipe, slide, dissolve
  * @param {number} [opts.transition_duration=1] - 转场持续时间，单位：秒
- * 
+ *
  */
 async function autoCutVideo(root_dir, output, opts = {}) {
     const { min_sec = 5, max_sec = 10, file_extensions = 'mp4,mov', transition_mode, transition_duration, progress_cb = null } = opts;
-    const clip_cb = (progress) => (progress_cb != null) && progress_cb((Number(progress) / 2).toFixed(2));
-    const concat_cb = (progress) => (progress_cb != null) && progress_cb(((Number(progress) / 2) + 50).toFixed(2));
+    const clip_cb = (progress) => progress_cb != null && progress_cb((Number(progress) / 2).toFixed(2));
+    const concat_cb = (progress) => progress_cb != null && progress_cb((Number(progress) / 2 + 50).toFixed(2));
     let clip_files = [];
     try {
         clip_files = await autoClipVideos(root_dir, { min_sec, max_sec, file_extensions, progress_cb: clip_cb });
@@ -361,7 +403,7 @@ async function autoCutVideo(root_dir, output, opts = {}) {
     } catch (error) {
         throw error;
     } finally {
-        await Promise.all(clip_files.map((file) => fs.unlink(file)));
+        for (const file of clip_files) await fs.unlink(file);
     }
 }
 
@@ -431,7 +473,7 @@ async function getAvailableAudioDecoders() {
  * progressHandler.setTotalDuration(duration);  number | string(‘00:00:30’)
  * process.stderr.pipeTo(new WritableStream({ write: (chunk) => progressHandler.handleOutput(chunk) }));
  */
-function createProgressHandler(progress_cb = () => { }) {
+function createProgressHandler(progress_cb = () => {}) {
     let totalDuration = 0;
     // 解析时长字符串为秒数
     const parseDuration = (timeStr) => {
@@ -479,13 +521,15 @@ export default {
     extraAudio,
     convertVideoFmt,
     getMetadata,
+    getVideoDuration,
     concatVideos,
     autoClipVideos,
     autoCutVideo,
+    remvoeAudio,
     getCodecs,
     getAvailableVideoEncoders,
     getAvailableVideoDecoders,
     getAvailableAudioEncoders,
     getAvailableAudioDecoders,
-    generateThumbnail
+    generateThumbnail,
 };
